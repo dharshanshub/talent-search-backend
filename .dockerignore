@@ -1,0 +1,16 @@
+.env
+*.env.local
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.git/
+.gitignore
+*.md
+# data is volume-mounted at runtime — exclude from build context
+# (PDFs can be 100+ MB total)
+data/
