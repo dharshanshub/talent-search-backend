@@ -24,6 +24,7 @@ from app.middleware.correlation import CorrelationMiddleware
 from app.services.embeddings import OpenAIEmbedder
 from app.services.llm import OpenAILLM
 from app.services.query_understanding import QueryUnderstandingService
+from app.services.screening import ScreeningService
 from app.services.search_service import SearchService
 from app.services.vector_store import PineconeStore
 
@@ -97,6 +98,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     app.state.search_service = search_service
 
+    screening_service = ScreeningService(
+        llm=llm,
+        embedder=embedder,
+        vector_store=vector_store,
+    )
+    app.state.screening_service = screening_service
+
     logger.info("startup_complete", pinecone_ready=index is not None)
     yield
 
@@ -137,3 +145,6 @@ def create_app() -> FastAPI:
     app.include_router(api_router)
 
     return app
+
+
+app = create_app()
