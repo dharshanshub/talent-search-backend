@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 import structlog
@@ -119,6 +120,99 @@ class PineconeStore:
         except Exception as exc:
             logger.warning("pinecone_describe_stats_failed", error=str(exc))
             return {}
+
+    async def list_candidates(self) -> list[dict[str, Any]]:
+        """Return one metadata record per unique candidate by listing all vector IDs,
+        grouping by candidate_id, then fetching chunk_0 for each.
+
+        Returns an empty list if Pinecone is unavailable or the index type does not
+        support list() (pod-based indexes). Each record includes all profile metadata
+        plus a `chunks` count.
+
+        Raises UpstreamServiceError on unexpected fetch failures.
+        """
+        if self._index is None:
+            return []
+
+        # ── Step 1: collect all vector IDs ───────────────────────────────────
+        def _collect_ids() -> list[str]:
+            ids: list[str] = []
+            for batch in self._index.list():
+                if isinstance(batch, list):
+                    ids.extend(batch)
+                else:
+                    # Some SDK versions yield a ListResponse object
+                    ids.extend(getattr(batch, "vectors", []) or [])
+            return ids
+
+        try:
+            all_ids: list[str] = await asyncio.to_thread(_collect_ids)
+        except Exception as exc:
+            logger.error("pinecone_list_failed", error=str(exc))
+            raise UpstreamServiceError("pinecone", f"list() failed: {exc}") from exc
+
+        if not all_ids:
+            return []
+
+        # ── Step 2: extract unique candidate_ids and count chunks ─────────────
+        chunk_counts: dict[str, int] = {}
+        for vid in all_ids:
+            cid = re.sub(r"_chunk_\d+$", "", vid)
+            chunk_counts[cid] = chunk_counts.get(cid, 0) + 1
+
+        # ── Step 3: fetch metadata from chunk_0 for each candidate ───────────
+        candidate_ids = list(chunk_counts.keys())
+        chunk0_ids = [f"{cid}_chunk_0" for cid in candidate_ids]
+
+        FETCH_BATCH = 100
+        records: list[dict[str, Any]] = []
+
+        for i in range(0, len(chunk0_ids), FETCH_BATCH):
+            batch_ids = chunk0_ids[i : i + FETCH_BATCH]
+            batch_cids = candidate_ids[i : i + FETCH_BATCH]
+            try:
+                result = await asyncio.to_thread(
+                    self._index.fetch, ids=batch_ids
+                )
+            except Exception as exc:
+                logger.error("pinecone_fetch_failed", offset=i, error=str(exc))
+                raise UpstreamServiceError("pinecone", f"fetch() failed at offset {i}: {exc}") from exc
+
+            vectors = getattr(result, "vectors", {}) or {}
+            for cid, chunk0_id in zip(batch_cids, batch_ids):
+                meta = {}
+                if chunk0_id in vectors:
+                    vec = vectors[chunk0_id]
+                    meta = getattr(vec, "metadata", {}) or {}
+                records.append({
+                    "candidate_id": cid,
+                    "chunks": chunk_counts[cid],
+                    **meta,
+                })
+
+        logger.info("list_candidates_done", total=len(records))
+        return records
+
+    async def delete_by_candidate_id(self, candidate_id: str) -> None:
+        """Delete all vectors for a candidate using a metadata filter.
+
+        This removes every chunk stored for the given candidate_id.
+
+        Raises:
+            UpstreamServiceError: if Pinecone is not initialised or the delete fails.
+        """
+        if self._index is None:
+            raise UpstreamServiceError("pinecone", "Pinecone index is not initialised")
+
+        try:
+            await asyncio.to_thread(
+                self._index.delete,
+                filter={"candidate_id": {"$eq": candidate_id}},
+            )
+            logger.info("pinecone_deleted_candidate", candidate_id=candidate_id)
+        except Exception as exc:
+            logger.error("pinecone_delete_failed", candidate_id=candidate_id, error=str(exc))
+            raise UpstreamServiceError("pinecone", f"Delete failed for '{candidate_id}': {exc}") from exc
 
     async def ping(self) -> bool:
         """Health check — raises RuntimeError if Pinecone is not connected."""
