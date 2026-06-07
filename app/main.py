@@ -91,6 +91,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     llm = OpenAILLM(client=openai_client, model=settings.openai_llm_model)
     query_understanding = QueryUnderstandingService(llm_client=llm)
+    app.state.embedder = embedder  # exposed for backfill endpoint
     search_service = SearchService(
         embedder=embedder,
         vector_store=vector_store,

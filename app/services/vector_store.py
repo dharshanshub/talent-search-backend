@@ -122,85 +122,113 @@ class PineconeStore:
             return {}
 
     async def list_candidates(self) -> list[dict[str, Any]]:
-        """Return one metadata record per unique candidate by listing all vector IDs,
-        grouping by candidate_id, then fetching chunk_0 for each.
+        """Return one metadata record per unique candidate.
 
-        Returns an empty list if Pinecone is unavailable or the index type does not
-        support list() (pod-based indexes). Each record includes all profile metadata
-        plus a `chunks` count.
+        Architecture — two tiers handled transparently:
 
-        Raises UpstreamServiceError on unexpected fetch failures.
+        Tier 1 (new): candidates indexed after the profile-vector change have a
+          dedicated vector with id = "profile_{candidate_id}".  list() with
+          prefix="profile_" returns exactly one ID per candidate — tiny URL, fast.
+
+        Tier 2 (legacy): older candidates only have chunk vectors.  We detect
+          them by finding _chunk_0 IDs whose candidate_id has no profile_ vector,
+          then fetch those instead.
+
+        fetch() is batched at 20 IDs max to stay well under Pinecone's URL limit.
         """
         if self._index is None:
             return []
 
-        # ── Step 1: collect all vector IDs ───────────────────────────────────
-        # Pinecone v7 list() yields ListItem objects with an .id attribute.
-        # Older SDK versions yielded plain strings or lists of strings.
-        def _extract_id(item) -> str:
-            if isinstance(item, str):
-                return item
-            return str(getattr(item, "id", item))
+        _FETCH_BATCH = 20  # safe ceiling: ~20 × 35-char IDs ≈ 700 chars in query string
 
-        def _collect_ids() -> list[str]:
+        # ── helper: Pinecone v7 yields ListItem objects; older SDKs yield strings ──
+        def _to_str(item: Any) -> str:
+            return item if isinstance(item, str) else str(getattr(item, "id", item))
+
+        def _list_prefix(prefix: str) -> list[str]:
             ids: list[str] = []
-            for batch in self._index.list():
+            for batch in self._index.list(prefix=prefix):
                 if isinstance(batch, list):
-                    ids.extend(_extract_id(item) for item in batch)
-                elif isinstance(batch, str):
-                    ids.append(batch)
+                    ids.extend(_to_str(x) for x in batch)
                 else:
-                    # Single ListItem (Pinecone v7 yields items directly)
-                    ids.append(_extract_id(batch))
+                    ids.append(_to_str(batch))
             return ids
 
+        # ── Step 1: collect profile_ IDs (Tier 1) ────────────────────────────
         try:
-            all_ids: list[str] = await asyncio.to_thread(_collect_ids)
+            profile_ids: list[str] = await asyncio.to_thread(_list_prefix, "profile_")
         except Exception as exc:
-            logger.error("pinecone_list_failed", error=str(exc))
-            raise UpstreamServiceError("pinecone", f"list() failed: {exc}") from exc
+            logger.error("pinecone_list_profile_failed", error=str(exc))
+            raise UpstreamServiceError("pinecone", f"list(prefix='profile_') failed: {exc}") from exc
 
-        if not all_ids:
-            return []
+        profiled_cids: set[str] = {vid[len("profile_"):] for vid in profile_ids}
 
-        # ── Step 2: extract unique candidate_ids and count chunks ─────────────
-        chunk_counts: dict[str, int] = {}
+        # ── Step 2: find legacy candidates (Tier 2) ──────────────────────────
+        # Only scan if there might be legacy data (heuristic: always check once)
+        legacy_fetch_ids: list[str] = []
+        try:
+            all_ids: list[str] = await asyncio.to_thread(_list_prefix, "")
+        except Exception as exc:
+            logger.warning("pinecone_list_all_failed", error=str(exc))
+            all_ids = []
+
         for vid in all_ids:
-            cid = re.sub(r"_chunk_\d+$", "", vid)
-            chunk_counts[cid] = chunk_counts.get(cid, 0) + 1
+            if re.search(r"_chunk_0$", vid):
+                cid = re.sub(r"_chunk_0$", "", vid)
+                if cid not in profiled_cids:
+                    legacy_fetch_ids.append(vid)  # chunk_0 id, used as fetch key
 
-        # ── Step 3: fetch metadata from chunk_0 for each candidate ───────────
-        candidate_ids = list(chunk_counts.keys())
-        chunk0_ids = [f"{cid}_chunk_0" for cid in candidate_ids]
+        logger.info(
+            "list_candidates_tiers",
+            profile_count=len(profile_ids),
+            legacy_count=len(legacy_fetch_ids),
+        )
 
-        FETCH_BATCH = 100
+        # ── Step 3: batch-fetch metadata for both tiers ───────────────────────
+        def _extract_meta(fetch_result: Any, requested_ids: list[str]) -> list[dict[str, Any]]:
+            vectors = getattr(fetch_result, "vectors", {}) or {}
+            rows = []
+            for vid in requested_ids:
+                meta: dict[str, Any] = {}
+                if vid in vectors:
+                    meta = dict(getattr(vectors[vid], "metadata", {}) or {})
+                # Derive candidate_id from the vector id
+                if vid.startswith("profile_"):
+                    cid = vid[len("profile_"):]
+                else:
+                    cid = re.sub(r"_chunk_0$", "", vid)
+                meta.setdefault("candidate_id", cid)
+                rows.append(meta)
+            return rows
+
         records: list[dict[str, Any]] = []
 
-        for i in range(0, len(chunk0_ids), FETCH_BATCH):
-            batch_ids = chunk0_ids[i : i + FETCH_BATCH]
-            batch_cids = candidate_ids[i : i + FETCH_BATCH]
-            try:
-                result = await asyncio.to_thread(
-                    self._index.fetch, ids=batch_ids
-                )
-            except Exception as exc:
-                logger.error("pinecone_fetch_failed", offset=i, error=str(exc))
-                raise UpstreamServiceError("pinecone", f"fetch() failed at offset {i}: {exc}") from exc
-
-            vectors = getattr(result, "vectors", {}) or {}
-            for cid, chunk0_id in zip(batch_cids, batch_ids):
-                meta = {}
-                if chunk0_id in vectors:
-                    vec = vectors[chunk0_id]
-                    meta = getattr(vec, "metadata", {}) or {}
-                records.append({
-                    "candidate_id": cid,
-                    "chunks": chunk_counts[cid],
-                    **meta,
-                })
+        for fetch_list in (profile_ids, legacy_fetch_ids):
+            for i in range(0, len(fetch_list), _FETCH_BATCH):
+                batch = fetch_list[i : i + _FETCH_BATCH]
+                try:
+                    result = await asyncio.to_thread(self._index.fetch, ids=batch)
+                except Exception as exc:
+                    logger.error("pinecone_fetch_failed", offset=i, batch_size=len(batch), error=str(exc))
+                    raise UpstreamServiceError("pinecone", f"fetch() failed at offset {i}: {exc}") from exc
+                records.extend(_extract_meta(result, batch))
 
         logger.info("list_candidates_done", total=len(records))
         return records
+
+    async def upsert_profile_vector(
+        self,
+        candidate_id: str,
+        embedding: list[float],
+        metadata: dict[str, Any],
+    ) -> None:
+        """Upsert a single profile_ vector for a candidate (used by backfill)."""
+        vector = {
+            "id":       f"profile_{candidate_id}",
+            "values":   embedding,
+            "metadata": {**metadata, "chunk_type": "profile", "candidate_id": candidate_id},
+        }
+        await self.upsert([vector])
 
     async def delete_by_candidate_id(self, candidate_id: str) -> None:
         """Delete all vectors for a candidate using a metadata filter.
