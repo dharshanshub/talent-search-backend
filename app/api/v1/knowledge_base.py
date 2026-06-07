@@ -56,10 +56,21 @@ def _parse_record(raw: dict) -> CandidateRecord:
     )
 
 
+_EXP_BUCKETS = ["0–2 yrs", "3–5 yrs", "6–9 yrs", "10+ yrs"]
+
+
+def _exp_bucket(years: int) -> str:
+    if years <= 2:  return "0–2 yrs"
+    if years <= 5:  return "3–5 yrs"
+    if years <= 9:  return "6–9 yrs"
+    return "10+ yrs"
+
+
 def _compute_stats(metadata_sample: list[dict], total: int) -> KnowledgeBaseStats:
     records = [_parse_record(r) for r in metadata_sample]
     sampled = len(records)
 
+    # Seniority distribution — fixed order, omit zeros
     seniority_counts = Counter(c.seniority for c in records if c.seniority)
     seniority_distribution = {
         s: seniority_counts[s]
@@ -67,23 +78,43 @@ def _compute_stats(metadata_sample: list[dict], total: int) -> KnowledgeBaseStat
         if seniority_counts[s] > 0
     }
 
+    # Average years of experience
     experiences = [c.years_experience for c in records]
     avg_exp = round(sum(experiences) / len(experiences), 1) if experiences else 0.0
 
+    # Experience range distribution — hiring-friendly buckets
+    bucket_counts = Counter(_exp_bucket(y) for y in experiences)
+    experience_distribution = {b: bucket_counts[b] for b in _EXP_BUCKETS if bucket_counts[b] > 0}
+
+    # Last indexed date
     dated = [c.indexed_at for c in records if c.indexed_at]
     last_added_at = max(dated) if dated else None
 
+    # Top skills across the pool
     all_skills: list[str] = []
     for c in records:
         all_skills.extend(c.skills)
-    top_skills = [skill for skill, _ in Counter(all_skills).most_common(10)]
+    top_skills = [s for s, _ in Counter(all_skills).most_common(10)]
+
+    # Top locations — useful for sourcing and remote/onsite decisions
+    all_locations = [c.location for c in records if c.location]
+    top_locations = [loc for loc, _ in Counter(all_locations).most_common(6)]
+
+    # Top industries — domain coverage of the talent pool
+    all_industries: list[str] = []
+    for c in records:
+        all_industries.extend(c.industries)
+    top_industries = [ind for ind, _ in Counter(all_industries).most_common(6)]
 
     return KnowledgeBaseStats(
         total_profiles=total,
         seniority_distribution=seniority_distribution,
         avg_experience_years=avg_exp,
+        experience_distribution=experience_distribution,
         last_added_at=last_added_at,
         top_skills=top_skills,
+        top_locations=top_locations,
+        top_industries=top_industries,
         is_sampled=sampled < total,
     )
 

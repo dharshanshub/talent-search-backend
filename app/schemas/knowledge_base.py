@@ -23,18 +23,22 @@ class KnowledgeBaseStats(BaseModel):
     avg_experience_years: float
     last_added_at: str | None
     top_skills: list[str]
-    # True when stats are computed from a sample (pool > 10 000 candidates)
+    # Experience bucketed into hiring-friendly ranges e.g. {"0–2 yrs": 12, "3–5 yrs": 34}
+    experience_distribution: dict[str, int]
+    # Top candidate locations and industries for sourcing decisions
+    top_locations: list[str]
+    top_industries: list[str]
+    # True when pool > 10 000 and stats are based on a sample
     is_sampled: bool = False
 
 
 class CandidatesPageResponse(BaseModel):
     candidates: list[CandidateRecord]
     next_cursor: str | None
-    # Total profile count — comes from stats cache; -1 means not yet computed
+    # Total profile count from stats cache; -1 = not yet computed
     total: int
 
 
-# Kept for backward compat with any direct consumers of the old single endpoint
 class KnowledgeBaseResponse(BaseModel):
     stats: KnowledgeBaseStats
     candidates: list[CandidateRecord]
