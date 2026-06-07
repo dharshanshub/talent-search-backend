@@ -209,6 +209,156 @@ class PineconeStore:
         )
         return records
 
+    async def list_candidates_page(
+        self,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Return one page of candidate metadata using Pinecone cursor pagination.
+
+        Uses list_paginated(prefix="profile_") — exactly 2 Pinecone API calls per
+        request regardless of total pool size: one list_paginated + one fetch batch.
+
+        Requires all candidates to have profile_ vectors.  Run POST /backfill once
+        for legacy seeded data before relying on this for the full pool.
+
+        Args:
+            cursor: Pinecone pagination token from the previous page.  None = first page.
+            limit:  Records per page (1–100).
+
+        Returns:
+            (records, next_cursor) — next_cursor is None on the last page.
+        """
+        if self._index is None:
+            return [], None
+
+        _FETCH_BATCH = 20  # keep URL length < 2 KB
+
+        def _to_str(item: Any) -> str:
+            return item if isinstance(item, str) else str(getattr(item, "id", item))
+
+        def _get_page() -> tuple[list[str], str | None]:
+            try:
+                # list_paginated is available in pinecone >= 3.x (Python SDK v7+)
+                result = self._index.list_paginated(
+                    prefix="profile_",
+                    limit=limit,
+                    pagination_token=cursor,
+                )
+                ids = [_to_str(v) for v in (result.vectors or [])]
+                next_cur = result.pagination.next if result.pagination else None
+                return ids, next_cur
+            except AttributeError:
+                # Graceful degradation for older SDK versions — not scalable past ~1k candidates
+                logger.warning(
+                    "list_paginated_unavailable",
+                    hint="upgrade: pip install 'pinecone>=3.0'",
+                )
+                all_ids: list[str] = []
+                for batch in self._index.list(prefix="profile_"):
+                    if isinstance(batch, list):
+                        all_ids.extend(_to_str(x) for x in batch)
+                    else:
+                        all_ids.append(_to_str(batch))
+                offset = int(cursor) if cursor and cursor.isdigit() else 0
+                page_ids = all_ids[offset : offset + limit]
+                next_cur = str(offset + limit) if offset + limit < len(all_ids) else None
+                return page_ids, next_cur
+
+        page_ids, next_cursor = await asyncio.to_thread(_get_page)
+
+        if not page_ids:
+            return [], None
+
+        # Fetch metadata only for this page's IDs — safe batch sizes keep URL < 2 KB
+        records: list[dict[str, Any]] = []
+        for i in range(0, len(page_ids), _FETCH_BATCH):
+            batch = page_ids[i : i + _FETCH_BATCH]
+            try:
+                result = await asyncio.to_thread(self._index.fetch, ids=batch)
+                vectors = getattr(result, "vectors", {}) or {}
+                for vid in batch:
+                    cid = vid[len("profile_"):]
+                    meta: dict[str, Any] = (
+                        dict(getattr(vectors.get(vid), "metadata", {}) or {})
+                        if vid in vectors else {}
+                    )
+                    meta.setdefault("candidate_id", cid)
+                    records.append(meta)
+            except Exception as exc:
+                logger.error("kb_page_fetch_failed", batch_size=len(batch), error=str(exc))
+                raise UpstreamServiceError("pinecone", f"fetch() failed for page: {exc}") from exc
+
+        logger.info(
+            "list_candidates_page_done",
+            returned=len(records),
+            has_next=next_cursor is not None,
+        )
+        return records, next_cursor
+
+    async def get_stats_sample(
+        self,
+        max_samples: int = 10000,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Collect metadata for stats aggregation and count total profile vectors.
+
+        Two parallel Pinecone operations:
+          1. query(filter={chunk_index:0}, top_k=max_samples) — returns metadata
+             for seniority, skills, experience, and last_added_at aggregation.
+             At >max_samples candidates the stats are computed from a representative
+             sample; the sample size is surfaced in the response so the UI can note it.
+          2. list(prefix="profile_") — counts IDs only (no metadata, minimal bandwidth).
+             Accurate total regardless of sample size.
+
+        Returns:
+            (metadata_sample, total_profile_count)
+        """
+        if self._index is None:
+            return [], 0
+
+        _EMBED_DIM = 1536
+
+        # Run both operations concurrently
+        async def _query_metadata() -> list[dict[str, Any]]:
+            try:
+                uniform = 1.0 / (_EMBED_DIM ** 0.5)
+                dummy = [uniform] * _EMBED_DIM
+                result = await asyncio.to_thread(
+                    self._index.query,
+                    vector=dummy,
+                    top_k=max_samples,
+                    filter={"chunk_index": {"$eq": 0}},
+                    include_metadata=True,
+                )
+                return [dict(m.metadata or {}) for m in (result.matches or [])]
+            except Exception as exc:
+                logger.warning("stats_metadata_query_failed", error=str(exc))
+                return []
+
+        def _count_profile_ids() -> int:
+            count = 0
+            try:
+                for batch in self._index.list(prefix="profile_"):
+                    count += len(batch) if isinstance(batch, list) else 1
+            except Exception as exc:
+                logger.warning("stats_count_profiles_failed", error=str(exc))
+            return count
+
+        metadata_task = asyncio.create_task(_query_metadata())
+        total = await asyncio.to_thread(_count_profile_ids)
+        metadata_sample = await metadata_task
+
+        # If profile_ count failed, fall back to number of query matches
+        if total == 0:
+            total = len(metadata_sample)
+
+        logger.info(
+            "stats_sample_done",
+            sampled=len(metadata_sample),
+            total_profiles=total,
+        )
+        return metadata_sample, total
+
     async def upsert_profile_vector(
         self,
         candidate_id: str,

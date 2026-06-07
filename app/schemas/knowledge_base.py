@@ -23,8 +23,18 @@ class KnowledgeBaseStats(BaseModel):
     avg_experience_years: float
     last_added_at: str | None
     top_skills: list[str]
+    # True when stats are computed from a sample (pool > 10 000 candidates)
+    is_sampled: bool = False
 
 
+class CandidatesPageResponse(BaseModel):
+    candidates: list[CandidateRecord]
+    next_cursor: str | None
+    # Total profile count — comes from stats cache; -1 means not yet computed
+    total: int
+
+
+# Kept for backward compat with any direct consumers of the old single endpoint
 class KnowledgeBaseResponse(BaseModel):
     stats: KnowledgeBaseStats
     candidates: list[CandidateRecord]
