@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from collections import Counter
 
 import structlog
@@ -154,18 +153,20 @@ class BackfillResponse(BaseModel):
 async def backfill_profile_vectors(request: Request) -> BackfillResponse:
     """One-time operation: create profile_ vectors for legacy candidates.
 
-    Legacy candidates were indexed before the profile-vector architecture was
-    introduced.  They have chunk vectors but no profile_ vector, so they won't
-    appear in the dashboard's Tier-1 fast path.
+    Legacy candidates (e.g. seeded data) have chunk vectors but no profile_ vector,
+    so they won't appear in the dashboard's Tier-1 fast path.
 
-    This endpoint:
-      1. Lists all _chunk_0 vector IDs (one per candidate).
-      2. Skips any that already have a profile_ vector.
-      3. Fetches chunk_0 metadata (include_values=True) and re-uses the embedding.
-      4. Upserts a profile_{candidate_id} vector for each remaining candidate.
+    Strategy:
+      1. list(prefix="profile_") — collect already-profiled candidate IDs.
+      2. query(filter={"chunk_index": 0}, include_values=True) — find one chunk per
+         legacy candidate, with the embedding already attached in the response.
+         This avoids list(prefix="") which is unreliable on Pinecone SDK v7 serverless.
+      3. Upsert a profile_{candidate_id} vector for each unprocessed candidate.
 
     Safe to call multiple times — already-profiled candidates are skipped.
     """
+    import asyncio as _asyncio
+
     request_id = get_correlation_id()
     logger.info("backfill_start", request_id=request_id)
 
@@ -175,84 +176,89 @@ async def backfill_profile_vectors(request: Request) -> BackfillResponse:
     if index is None:
         raise BadRequestError("Pinecone is not connected")
 
-    import asyncio
+    _EMBED_DIM = 1536   # OpenAI text-embedding-3-small
+    _UPSERT_BATCH = 100
 
-    _FETCH_BATCH = 20
-
+    # ── Step 1: which candidates already have profile vectors? ────────────────
     def _to_str(item) -> str:
         return item if isinstance(item, str) else str(getattr(item, "id", item))
 
-    def _list_prefix(prefix: str) -> list[str]:
+    def _list_profile_ids_sync() -> list[str]:
         ids: list[str] = []
-        for batch in index.list(prefix=prefix):
-            if isinstance(batch, list):
-                ids.extend(_to_str(x) for x in batch)
-            else:
-                ids.append(_to_str(batch))
+        try:
+            for batch in index.list(prefix="profile_"):
+                if isinstance(batch, list):
+                    ids.extend(_to_str(x) for x in batch)
+                else:
+                    ids.append(_to_str(batch))
+        except Exception as exc:
+            logger.warning("backfill_list_profile_failed", error=str(exc))
         return ids
 
-    # Which candidates already have profile vectors?
-    profile_ids = await asyncio.to_thread(_list_prefix, "profile_")
-    profiled_cids = {vid[len("profile_"):] for vid in profile_ids}
+    profile_ids = await _asyncio.to_thread(_list_profile_ids_sync)
+    profiled_cids: set[str] = {vid[len("profile_"):] for vid in profile_ids}
 
-    # Which chunk_0 IDs exist?
-    all_ids = await asyncio.to_thread(_list_prefix, "")
-    chunk0_ids = [
-        vid for vid in all_ids
-        if re.search(r"_chunk_0$", vid)
-        and re.sub(r"_chunk_0$", "", vid) not in profiled_cids
-    ]
+    # ── Step 2: find legacy chunk_0 vectors via query() ───────────────────────
+    # include_values=True so we can reuse the embedding for the new profile_ vector.
+    try:
+        uniform = 1.0 / (_EMBED_DIM ** 0.5)
+        dummy = [uniform] * _EMBED_DIM
+        query_result = await _asyncio.to_thread(
+            index.query,
+            vector=dummy,
+            top_k=10000,
+            filter={"chunk_index": {"$eq": 0}},
+            include_metadata=True,
+            include_values=True,
+        )
+    except Exception as exc:
+        logger.error("backfill_query_failed", error=str(exc), request_id=request_id)
+        raise BadRequestError(f"Pinecone query failed during backfill: {exc}") from exc
+
+    # ── Step 3: build list of new profile vectors to upsert ───────────────────
+    to_create: list[dict] = []
+    already_profiled = 0
+
+    for match in (query_result.matches or []):
+        meta = dict(match.metadata or {})
+        cid = meta.get("candidate_id", "")
+        values = getattr(match, "values", None) or []
+
+        if not cid:
+            continue
+        if cid in profiled_cids:
+            already_profiled += 1
+            continue
+        if not values:
+            logger.warning("backfill_no_embedding", candidate_id=cid)
+            continue
+
+        to_create.append({
+            "id":       f"profile_{cid}",
+            "values":   values,
+            "metadata": {**meta, "chunk_type": "profile", "candidate_id": cid},
+        })
 
     logger.info(
-        "backfill_candidates_to_create",
-        total=len(chunk0_ids),
-        already_profiled=len(profiled_cids),
+        "backfill_candidates",
+        to_create=len(to_create),
+        already_profiled=already_profiled,
         request_id=request_id,
     )
 
-    created = skipped = failed = 0
+    # ── Step 4: upsert in batches ─────────────────────────────────────────────
+    created = failed = 0
+    skipped = already_profiled
 
-    for i in range(0, len(chunk0_ids), _FETCH_BATCH):
-        batch = chunk0_ids[i : i + _FETCH_BATCH]
+    for i in range(0, len(to_create), _UPSERT_BATCH):
+        batch = to_create[i : i + _UPSERT_BATCH]
         try:
-            result = await asyncio.to_thread(index.fetch, ids=batch, include_values=True)
+            await _asyncio.to_thread(index.upsert, vectors=batch)
+            created += len(batch)
+            logger.info("backfill_batch_upserted", count=len(batch), offset=i)
         except Exception as exc:
-            logger.error("backfill_fetch_failed", offset=i, error=str(exc), request_id=request_id)
+            logger.error("backfill_upsert_failed", offset=i, error=str(exc))
             failed += len(batch)
-            continue
-
-        vectors = getattr(result, "vectors", {}) or {}
-        profile_vectors = []
-
-        for chunk0_id in batch:
-            if chunk0_id not in vectors:
-                skipped += 1
-                continue
-
-            vec = vectors[chunk0_id]
-            meta = dict(getattr(vec, "metadata", {}) or {})
-            values = getattr(vec, "values", None)
-
-            if not values:
-                logger.warning("backfill_no_embedding", chunk0_id=chunk0_id)
-                skipped += 1
-                continue
-
-            cid = re.sub(r"_chunk_0$", "", chunk0_id)
-            profile_vectors.append({
-                "id":       f"profile_{cid}",
-                "values":   values,
-                "metadata": {**meta, "chunk_type": "profile", "candidate_id": cid},
-            })
-
-        if profile_vectors:
-            try:
-                await asyncio.to_thread(index.upsert, vectors=profile_vectors)
-                created += len(profile_vectors)
-                logger.info("backfill_batch_upserted", count=len(profile_vectors), offset=i)
-            except Exception as exc:
-                logger.error("backfill_upsert_failed", offset=i, error=str(exc))
-                failed += len(profile_vectors)
 
     logger.info(
         "backfill_done",
