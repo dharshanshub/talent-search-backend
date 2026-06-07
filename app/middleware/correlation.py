@@ -14,29 +14,36 @@ logger = structlog.get_logger(__name__)
 
 CORRELATION_HEADER = "X-Request-ID"
 
+# Probe paths that are infrastructure noise — never log these
+SILENT_PATHS = {"/healthz", "/health", "/ping"}
+
 
 class CorrelationMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         request_id = request.headers.get(CORRELATION_HEADER) or str(uuid.uuid4())
         set_correlation_id(request_id)
 
+        silent = request.url.path in SILENT_PATHS
+
         start = time.perf_counter()
-        logger.info(
-            "request_started",
-            method=request.method,
-            path=request.url.path,
-        )
+        if not silent:
+            logger.info(
+                "request_started",
+                method=request.method,
+                path=request.url.path,
+            )
 
         response = await call_next(request)
 
-        duration_ms = round((time.perf_counter() - start) * 1000, 2)
-        logger.info(
-            "request_finished",
-            method=request.method,
-            path=request.url.path,
-            status_code=response.status_code,
-            duration_ms=duration_ms,
-        )
+        if not silent:
+            duration_ms = round((time.perf_counter() - start) * 1000, 2)
+            logger.info(
+                "request_finished",
+                method=request.method,
+                path=request.url.path,
+                status_code=response.status_code,
+                duration_ms=duration_ms,
+            )
 
         response.headers[CORRELATION_HEADER] = request_id
         return response

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from datetime import date
 from typing import Any
 
@@ -35,10 +34,11 @@ Return ONLY a valid JSON object with exactly these fields — no markdown, no ex
 }
 
 Rules:
-- years_experience must be an integer
-- skills: technical skills only, no soft skills
-- seniority: infer from title and experience if not explicit
-- If a field cannot be determined, use a sensible default (empty string, 0, or empty list)
+- years_experience: integer — calculate total professional experience by summing the durations of all work positions listed. If dates overlap, do not double-count. If a role says "2 years" use that; if it shows start/end dates, compute the difference. Default to 0 if no experience is mentioned.
+- skills: extract ONLY concrete, specific technical skills — programming languages (Python, Go, TypeScript), frameworks (React, FastAPI, Spring Boot), databases (PostgreSQL, MongoDB, Redis), cloud/infra tools (AWS, Docker, Kubernetes, Terraform), ML/data tools (PyTorch, TensorFlow, Spark, Pandas). Do NOT include soft skills (communication, leadership), methodologies (Agile, Scrum), or vague terms (software development, problem solving).
+- seniority: infer from job title and total years_experience — Junior (<2 yrs), Mid-Level (2-5 yrs), Senior (5-9 yrs), Staff (9-13 yrs), Principal (13+ yrs). Override with explicit title if present.
+- industries: list the business domains the candidate has worked in (e.g. Fintech, Healthcare, E-commerce, SaaS, Gaming, Cybersecurity, EdTech).
+- If a field cannot be determined, use a sensible default (empty string, 0, or empty list).
 """
 
 # Text splitter shared across all calls — thread-safe, stateless
@@ -132,19 +132,28 @@ class ScreeningService:
         )
         return profile
 
-    async def index(self, profile: ExtractedProfile, raw_text: str) -> IndexResponse:
+    async def index(
+        self,
+        candidate_id: str,
+        blob_filename: str,
+        profile: ExtractedProfile,
+        raw_text: str,
+    ) -> IndexResponse:
         """Chunk, embed, and upsert a validated candidate profile into Pinecone.
+
+        candidate_id and blob_filename are generated at upload time and passed
+        through so the PDF in Blob Storage is already linked before indexing.
 
         Raises:
             BadRequestError: if the resume text produces no chunks.
             UpstreamServiceError: if embedding or upsert fails.
         """
-        candidate_id = f"uploaded_{uuid.uuid4().hex[:10]}"
         today = date.today().isoformat()
 
         logger.info(
             "indexing_start",
             candidate_id=candidate_id,
+            blob_filename=blob_filename,
             name=profile.name,
             raw_text_chars=len(raw_text),
         )
@@ -181,6 +190,7 @@ class ScreeningService:
                     "candidate_id":     candidate_id,
                     "chunk_index":      idx,
                     "chunk_type":       "general",
+                    "blob_filename":    blob_filename,
                     "name":             profile.name,
                     "title":            profile.title,
                     "role":             profile.role,

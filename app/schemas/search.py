@@ -20,6 +20,9 @@ class CandidateMatch(BaseModel):
     last_updated: date
     score: float = Field(..., description="Similarity score [0, 1]")
     summary: str | None = None
+    # Blob filename stored in Pinecone metadata at index time.
+    # None for legacy seeded candidates — View Resume is hidden for those.
+    blob_filename: str | None = None
 
 
 class SearchResponse(BaseModel):

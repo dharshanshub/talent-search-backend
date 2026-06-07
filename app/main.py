@@ -21,6 +21,7 @@ from app.core.error_handlers import (
 from app.core.exceptions import AppException
 from app.core.logging import configure_logging
 from app.middleware.correlation import CorrelationMiddleware
+from app.services.blob_storage import BlobStorageService
 from app.services.embeddings import OpenAIEmbedder
 from app.services.llm import OpenAILLM
 from app.services.query_understanding import QueryUnderstandingService
@@ -77,7 +78,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                         index=settings.pinecone_index_name)
             if total_vectors == 0:
                 logger.warning("pinecone_index_empty",
-                               hint="Run: python -m app.scripts.seed_index")
+                               hint="Upload resumes via the Screen Resume feature")
         except Exception as exc:
             logger.warning("pinecone_stats_failed", reason=str(exc))
 
@@ -105,7 +106,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     app.state.screening_service = screening_service
 
-    logger.info("startup_complete", pinecone_ready=index is not None)
+    # Azure Blob Storage — optional; empty connection string = local disk fallback
+    blob_service = BlobStorageService(
+        connection_string=settings.azure_storage_connection_string,
+        container=settings.azure_storage_container,
+    )
+    app.state.blob_service = blob_service
+
+    logger.info(
+        "startup_complete",
+        pinecone_ready=index is not None,
+        blob_storage_ready=blob_service.available,
+    )
     yield
 
     logger.info("shutdown_begin")

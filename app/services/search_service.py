@@ -141,6 +141,8 @@ class SearchService:
                     years_experience=years_exp,
                     last_updated=last_updated,
                     score=round(float(match["score"]), 4),
+                    # blob_filename is None for legacy seeded candidates
+                    blob_filename=meta.get("blob_filename") or None,
                 )
             )
 

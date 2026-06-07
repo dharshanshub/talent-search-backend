@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     embedding_dim: int = 1536
     top_k: int = 5
 
+    # Azure Blob Storage — optional; leave empty to fall back to local disk
+    azure_storage_connection_string: str = ""
+    azure_storage_container: str = "resumes"
+
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",")]
 
