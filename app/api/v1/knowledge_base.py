@@ -7,7 +7,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from app.core.exceptions import BadRequestError
+from app.core.exceptions import BadRequestError, NotFoundError
 from app.core.logging import get_correlation_id
 from app.schemas.knowledge_base import (
     CandidateRecord,
@@ -141,6 +141,44 @@ async def delete_candidate(candidate_id: str, request: Request) -> Response:
         request_id=request_id,
     )
     return Response(status_code=204)
+
+
+class ResumeUrlResponse(BaseModel):
+    url: str
+    expires_in: int  # seconds
+
+
+@router.get("/{candidate_id}/resume", response_model=ResumeUrlResponse)
+async def get_resume_url(candidate_id: str, request: Request) -> ResumeUrlResponse:
+    """Generate a short-lived SAS URL for viewing a candidate's source PDF.
+
+    The URL is valid for 15 minutes and is intended to be opened directly in
+    the browser (inline display, no download).  Returns 404 if the candidate
+    has no associated PDF in Blob Storage (e.g. seeded candidates without an
+    uploaded file).
+
+    Raises:
+        BadRequestError: if candidate_id contains unsafe characters.
+        NotFoundError:   if Blob Storage is not configured.
+        UpstreamServiceError: if SAS generation fails.
+    """
+    if not all(c.isalnum() or c in "_-" for c in candidate_id):
+        raise BadRequestError("Invalid candidate ID")
+
+    blob_service = request.app.state.blob_service
+
+    if not blob_service.available:
+        raise NotFoundError("Blob Storage is not configured — no PDF available for this candidate")
+
+    blob_name = f"{candidate_id}.pdf"
+    expiry_minutes = 15
+
+    url = await blob_service.get_sas_url(blob_name, expiry_minutes=expiry_minutes)
+    if url is None:
+        raise NotFoundError("No PDF found for this candidate")
+
+    logger.info("resume_url_generated", candidate_id=candidate_id, expires_in=expiry_minutes * 60)
+    return ResumeUrlResponse(url=url, expires_in=expiry_minutes * 60)
 
 
 class BackfillResponse(BaseModel):
