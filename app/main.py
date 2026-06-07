@@ -21,6 +21,7 @@ from app.core.error_handlers import (
 from app.core.exceptions import AppException
 from app.core.logging import configure_logging
 from app.middleware.correlation import CorrelationMiddleware
+from app.services.agent import AgentService
 from app.services.blob_storage import BlobStorageService
 from app.services.embeddings import OpenAIEmbedder
 from app.services.llm import OpenAILLM
@@ -98,6 +99,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         top_k=settings.top_k,
     )
     app.state.search_service = search_service
+
+    # Agentic layer — sits in front of search, handles routing + streaming
+    agent = AgentService(
+        openai_client=openai_client,
+        search_service=search_service,
+        model=settings.openai_llm_model,
+    )
+    app.state.agent = agent
 
     screening_service = ScreeningService(
         llm=llm,
