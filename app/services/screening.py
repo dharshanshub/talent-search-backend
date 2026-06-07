@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 import structlog
@@ -149,6 +149,7 @@ class ScreeningService:
             UpstreamServiceError: if embedding or upsert fails.
         """
         today = date.today().isoformat()
+        indexed_at = datetime.now(timezone.utc).isoformat()
 
         logger.info(
             "indexing_start",
@@ -200,6 +201,7 @@ class ScreeningService:
                     "skills":           skills_str,
                     "industries":       industries_str,
                     "last_updated":     today,
+                    "indexed_at":       indexed_at,
                 },
             }
             for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings))

@@ -88,6 +88,33 @@ class BlobStorageService:
                 "azure_blob", f"Upload failed for '{blob_name}': {exc}"
             ) from exc
 
+    async def delete(self, blob_name: str) -> bool:
+        """Delete a blob. Returns True if deleted, False if not found or storage not configured.
+
+        Raises:
+            UpstreamServiceError: if the delete call fails for reasons other than not found.
+        """
+        if not self._available or self._client is None:
+            logger.debug("blob_delete_skipped", blob_name=blob_name, reason="not_configured")
+            return False
+
+        try:
+            blob_client = self._client.get_blob_client(
+                container=self._container, blob=blob_name
+            )
+            await asyncio.to_thread(blob_client.delete_blob)
+            logger.info("blob_deleted", blob_name=blob_name)
+            return True
+        except Exception as exc:
+            error_str = str(exc).lower()
+            if "blobnotfound" in error_str or "not found" in error_str or "404" in error_str:
+                logger.info("blob_delete_not_found", blob_name=blob_name)
+                return False
+            logger.error("blob_delete_failed", blob_name=blob_name, error=str(exc))
+            raise UpstreamServiceError(
+                "azure_blob", f"Delete failed for '{blob_name}': {exc}"
+            ) from exc
+
     async def get_sas_url(self, blob_name: str, expiry_minutes: int = 60) -> str | None:
         """Generate a time-limited SAS URL for reading a blob.
 
