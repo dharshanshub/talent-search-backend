@@ -88,6 +88,28 @@ class BlobStorageService:
                 "azure_blob", f"Upload failed for '{blob_name}': {exc}"
             ) from exc
 
+    async def download(self, blob_name: str) -> bytes:
+        """Download a blob and return its raw bytes.
+
+        Raises:
+            UpstreamServiceError: if storage is not configured or the download fails.
+        """
+        if not self._available or self._client is None:
+            raise UpstreamServiceError("azure_blob", "Blob storage is not configured")
+        try:
+            blob_client = self._client.get_blob_client(
+                container=self._container, blob=blob_name
+            )
+            stream = await asyncio.to_thread(blob_client.download_blob)
+            data: bytes = await asyncio.to_thread(stream.readall)
+            logger.debug("blob_downloaded", blob_name=blob_name, bytes=len(data))
+            return data
+        except Exception as exc:
+            logger.error("blob_download_failed", blob_name=blob_name, error=str(exc))
+            raise UpstreamServiceError(
+                "azure_blob", f"Download failed for '{blob_name}': {exc}"
+            ) from exc
+
     async def delete(self, blob_name: str) -> bool:
         """Delete a blob. Returns True if deleted, False if not found or storage not configured.
 

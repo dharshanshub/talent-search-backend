@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     azure_storage_connection_string: str = ""
     azure_storage_container: str = "resumes"
 
+    # JWT — set JWT_SECRET_KEY to a random 32+ char string in production
+    jwt_secret_key: str = "change-me-in-production-use-a-long-random-string"
+    jwt_algorithm: str = "HS256"
+    jwt_expiry_minutes: int = 480  # 8 hours
+
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",")]
 
