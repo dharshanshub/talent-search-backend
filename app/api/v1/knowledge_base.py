@@ -182,15 +182,15 @@ async def list_candidates_page(
     request: Request,
     cursor: str | None = Query(default=None, description="Pagination token from previous response"),
     limit: int = Query(default=20, ge=1, le=100, description="Records per page"),
+    search: str | None = Query(default=None, max_length=200, description="Filter all profiles by name, title, or role"),
 ) -> CandidatesPageResponse:
-    """Cursor-paginated candidate list — O(1) per page regardless of pool size.
+    """Candidate list — paginated browse or full-pool name/title/role search.
 
-    Pass the returned next_cursor as cursor on the next request to advance.
-    next_cursor=null means you are on the last page.
+    Without search: cursor-paginated, O(1) per page.
+    With search: scans all profiles, returns every match, no pagination (next_cursor=null).
 
     total comes from the stats cache (instant if /stats was called first).
-    If stats have not been computed yet it returns -1 — the UI should call
-    /stats in parallel to get the accurate count.
+    If stats have not been computed yet it returns -1.
     """
     request_id = get_correlation_id()
     vector_store = request.app.state.vector_store
@@ -198,6 +198,7 @@ async def list_candidates_page(
     raw_records, next_cursor = await vector_store.list_candidates_page(
         cursor=cursor,
         limit=limit,
+        search=search.strip() if search else None,
     )
 
     candidates = [_parse_record(r) for r in raw_records]
