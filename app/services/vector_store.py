@@ -135,14 +135,23 @@ class PineconeStore:
             return []
 
         # ── Step 1: collect all vector IDs ───────────────────────────────────
+        # Pinecone v7 list() yields ListItem objects with an .id attribute.
+        # Older SDK versions yielded plain strings or lists of strings.
+        def _extract_id(item) -> str:
+            if isinstance(item, str):
+                return item
+            return str(getattr(item, "id", item))
+
         def _collect_ids() -> list[str]:
             ids: list[str] = []
             for batch in self._index.list():
                 if isinstance(batch, list):
-                    ids.extend(batch)
+                    ids.extend(_extract_id(item) for item in batch)
+                elif isinstance(batch, str):
+                    ids.append(batch)
                 else:
-                    # Some SDK versions yield a ListResponse object
-                    ids.extend(getattr(batch, "vectors", []) or [])
+                    # Single ListItem (Pinecone v7 yields items directly)
+                    ids.append(_extract_id(batch))
             return ids
 
         try:
