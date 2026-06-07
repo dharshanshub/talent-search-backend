@@ -61,7 +61,17 @@ class SearchService:
             logger.error("query_parse_failed", error=str(exc), request_id=request_id)
             raise UpstreamServiceError("openai", f"Query parsing failed: {exc}") from exc
 
-        # ── 2. Embed the semantic text ─────────────────────────────────────
+        # ── 2. Guard: non-talent queries produce empty semantic text ──────────
+        if not parsed.semantic_text.strip():
+            logger.info("query_not_talent_search", query=request.query, request_id=request_id)
+            return SearchResponse(
+                query=request.query,
+                answer="I can help you find candidates. Try describing the role or skills you need — for example: \"senior Python engineer with ML experience\" or \"frontend developer React Berlin\".",
+                candidates=[],
+                request_id=request_id,
+            )
+
+        # ── 3. Embed the semantic text ─────────────────────────────────────
         try:
             vector = await self._embedder.embed(parsed.semantic_text)
         except UpstreamServiceError:
@@ -155,6 +165,90 @@ class SearchService:
             candidates=candidates,
             request_id=request_id,
         )
+
+    async def retrieve(self, query: str, top_k: int | None, request_id: str) -> list[CandidateMatch]:
+        """Run retrieval only — parse query, embed, search Pinecone, deduplicate.
+
+        Used by the agent which generates its own answer via streaming.
+        Returns an empty list when the query has no talent-search intent.
+        """
+        effective_top_k = top_k or self._top_k
+
+        try:
+            parsed = await self._query_understanding.parse(query)
+        except Exception as exc:
+            logger.error("query_parse_failed", error=str(exc), request_id=request_id)
+            raise UpstreamServiceError("openai", f"Query parsing failed: {exc}") from exc
+
+        if not parsed.semantic_text.strip():
+            return []
+
+        try:
+            vector = await self._embedder.embed(parsed.semantic_text)
+        except UpstreamServiceError:
+            raise
+        except Exception as exc:
+            logger.error("query_embed_failed", error=str(exc), request_id=request_id)
+            raise UpstreamServiceError("openai", f"Query embedding failed: {exc}") from exc
+
+        pinecone_filter: dict | None = None
+        if parsed.min_years:
+            pinecone_filter = {"years_experience": {"$gte": parsed.min_years}}
+
+        try:
+            raw_matches = await self._store.query(
+                vector=vector,
+                top_k=effective_top_k * 5,
+                filter=pinecone_filter,
+            )
+        except UpstreamServiceError:
+            raise
+        except Exception as exc:
+            logger.error("pinecone_query_error", error=str(exc), request_id=request_id)
+            raise UpstreamServiceError("pinecone", f"Vector search failed: {exc}") from exc
+
+        best: dict[str, dict] = {}
+        for match in raw_matches:
+            cid = match["metadata"].get("candidate_id", match["id"])
+            if cid not in best or match["score"] > best[cid]["score"]:
+                best[cid] = match
+
+        top_matches = sorted(best.values(), key=lambda x: x["score"], reverse=True)[:effective_top_k]
+
+        candidates: list[CandidateMatch] = []
+        for match in top_matches:
+            meta = match["metadata"]
+            skills_list = [s.strip() for s in meta.get("skills", "").split(",") if s.strip()]
+            try:
+                last_updated = date.fromisoformat(meta.get("last_updated", "2024-01-01"))
+            except (ValueError, TypeError):
+                last_updated = date(2024, 1, 1)
+            try:
+                years_exp = int(meta.get("years_experience", 0))
+            except (ValueError, TypeError):
+                years_exp = 0
+
+            candidates.append(
+                CandidateMatch(
+                    id=meta.get("candidate_id", match["id"]),
+                    name=meta.get("name", "Unknown"),
+                    title=meta.get("title", ""),
+                    location=meta.get("location", ""),
+                    skills=skills_list,
+                    years_experience=years_exp,
+                    last_updated=last_updated,
+                    score=round(float(match["score"]), 4),
+                    blob_filename=meta.get("blob_filename") or None,
+                )
+            )
+
+        logger.info(
+            "retrieve_done",
+            query=query,
+            returned=len(candidates),
+            request_id=request_id,
+        )
+        return candidates
 
     async def _generate_answer(self, query: str, candidates: list[CandidateMatch]) -> str:
         """Generate a recruiter-facing summary. Falls back to a static message on failure."""

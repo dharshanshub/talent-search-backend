@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 import structlog
@@ -149,6 +149,7 @@ class ScreeningService:
             UpstreamServiceError: if embedding or upsert fails.
         """
         today = date.today().isoformat()
+        indexed_at = datetime.now(timezone.utc).isoformat()
 
         logger.info(
             "indexing_start",
@@ -200,6 +201,7 @@ class ScreeningService:
                     "skills":           skills_str,
                     "industries":       industries_str,
                     "last_updated":     today,
+                    "indexed_at":       indexed_at,
                 },
             }
             for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings))
@@ -212,6 +214,35 @@ class ScreeningService:
         except Exception as exc:
             logger.error("indexing_upsert_failed", error=str(exc), candidate_id=candidate_id)
             raise UpstreamServiceError("pinecone", f"Upsert failed: {exc}") from exc
+
+        # Upsert one dedicated profile vector: id = "profile_{candidate_id}".
+        # This allows the dashboard to list() with prefix="profile_" — one ID per
+        # candidate, tiny batch sizes, no URL-length issues. Uses chunk_0's embedding.
+        shared_meta = {
+            "candidate_id":     candidate_id,
+            "chunk_type":       "profile",
+            "blob_filename":    blob_filename,
+            "name":             profile.name,
+            "title":            profile.title,
+            "role":             profile.role,
+            "seniority":        profile.seniority,
+            "location":         profile.location,
+            "years_experience": profile.years_experience,
+            "skills":           skills_str,
+            "industries":       industries_str,
+            "last_updated":     today,
+            "indexed_at":       indexed_at,
+        }
+        profile_vector = {
+            "id":       f"profile_{candidate_id}",
+            "values":   embeddings[0],
+            "metadata": shared_meta,
+        }
+        try:
+            await self._store.upsert([profile_vector])
+        except Exception as exc:
+            # Non-fatal — chunks are indexed; profile vector is an optimisation.
+            logger.warning("profile_vector_upsert_failed", candidate_id=candidate_id, error=str(exc))
 
         logger.info(
             "indexing_done",

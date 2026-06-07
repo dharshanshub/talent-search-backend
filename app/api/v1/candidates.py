@@ -213,6 +213,10 @@ async def index_candidate(body: IndexRequest, request: Request) -> IndexResponse
         logger.error("index_unexpected", error=str(exc), request_id=request_id)
         raise UpstreamServiceError("pinecone", f"Unexpected indexing error: {exc}") from exc
 
+    # Invalidate KB stats cache — total_profiles has increased
+    if hasattr(request.app.state, "kb_stats_cache"):
+        request.app.state.kb_stats_cache["cached_at"] = None
+
     logger.info(
         "index_done",
         candidate_id=result.candidate_id,
