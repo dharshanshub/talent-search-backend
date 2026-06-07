@@ -213,6 +213,7 @@ class PineconeStore:
         self,
         cursor: str | None,
         limit: int,
+        search: str | None = None,
     ) -> tuple[list[dict[str, Any]], str | None]:
         """Return one page of candidate metadata.
 
@@ -240,6 +241,36 @@ class PineconeStore:
 
         def _to_str(item: Any) -> str:
             return item if isinstance(item, str) else str(getattr(item, "id", item))
+
+        # ── Search mode: query all, filter by name/title/role, return all matches ──
+        # When a search term is provided we skip pagination entirely and return every
+        # candidate whose name, title, or role contains the term (case-insensitive).
+        # Uses the same query(chunk_index=0) path as stats — always reliable on serverless.
+        if search:
+            search_lower = search.strip().lower()
+            try:
+                uniform = 1.0 / (_EMBED_DIM ** 0.5)
+                dummy = [uniform] * _EMBED_DIM
+                query_result = await asyncio.to_thread(
+                    self._index.query,
+                    vector=dummy,
+                    top_k=10000,
+                    filter={"chunk_index": {"$eq": 0}},
+                    include_metadata=True,
+                )
+                all_records = [dict(m.metadata or {}) for m in (query_result.matches or [])]
+            except Exception as exc:
+                logger.error("kb_search_query_failed", search=search, error=str(exc))
+                raise UpstreamServiceError("pinecone", f"Search query failed: {exc}") from exc
+
+            matches = [
+                r for r in all_records
+                if search_lower in (r.get("name") or "").lower()
+                or search_lower in (r.get("title") or "").lower()
+                or search_lower in (r.get("role") or "").lower()
+            ]
+            logger.info("list_candidates_search_done", term=search, matched=len(matches), total_scanned=len(all_records))
+            return matches, None
 
         # ── Primary: list_paginated + fetch ───────────────────────────────────
         def _get_page_primary() -> tuple[list[str], str | None]:
