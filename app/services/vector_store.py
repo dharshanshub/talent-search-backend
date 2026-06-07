@@ -214,16 +214,19 @@ class PineconeStore:
         cursor: str | None,
         limit: int,
     ) -> tuple[list[dict[str, Any]], str | None]:
-        """Return one page of candidate metadata using Pinecone cursor pagination.
+        """Return one page of candidate metadata.
 
-        Uses list_paginated(prefix="profile_") — exactly 2 Pinecone API calls per
-        request regardless of total pool size: one list_paginated + one fetch batch.
+        Primary path: list_paginated(prefix="profile_") + fetch().
+        Fallback path: query(chunk_index=0) + integer offset cursor.
 
-        Requires all candidates to have profile_ vectors.  Run POST /backfill once
-        for legacy seeded data before relying on this for the full pool.
+        Pinecone SDK v7 on serverless indexes does not honour prefix filters on
+        list/list_paginated, so both return empty even when profile_ vectors exist.
+        The fallback uses query() which is always reliable on serverless — the same
+        path search and stats already use.
 
         Args:
-            cursor: Pinecone pagination token from the previous page.  None = first page.
+            cursor: Pinecone pagination token (primary) or integer offset string
+                    (fallback).  None = first page.
             limit:  Records per page (1–100).
 
         Returns:
@@ -233,68 +236,79 @@ class PineconeStore:
             return [], None
 
         _FETCH_BATCH = 20  # keep URL length < 2 KB
+        _EMBED_DIM = 1536
 
         def _to_str(item: Any) -> str:
             return item if isinstance(item, str) else str(getattr(item, "id", item))
 
-        def _get_page() -> tuple[list[str], str | None]:
+        # ── Primary: list_paginated + fetch ───────────────────────────────────
+        def _get_page_primary() -> tuple[list[str], str | None]:
             try:
-                # list_paginated is available in pinecone >= 3.x (Python SDK v7+)
                 result = self._index.list_paginated(
                     prefix="profile_",
                     limit=limit,
-                    pagination_token=cursor,
+                    pagination_token=cursor if cursor and not cursor.isdigit() else None,
                 )
                 ids = [_to_str(v) for v in (result.vectors or [])]
                 next_cur = result.pagination.next if result.pagination else None
                 return ids, next_cur
             except AttributeError:
-                # Graceful degradation for older SDK versions — not scalable past ~1k candidates
-                logger.warning(
-                    "list_paginated_unavailable",
-                    hint="upgrade: pip install 'pinecone>=3.0'",
-                )
-                all_ids: list[str] = []
-                for batch in self._index.list(prefix="profile_"):
-                    if isinstance(batch, list):
-                        all_ids.extend(_to_str(x) for x in batch)
-                    else:
-                        all_ids.append(_to_str(batch))
-                offset = int(cursor) if cursor and cursor.isdigit() else 0
-                page_ids = all_ids[offset : offset + limit]
-                next_cur = str(offset + limit) if offset + limit < len(all_ids) else None
-                return page_ids, next_cur
+                logger.warning("list_paginated_unavailable", hint="upgrade pinecone>=3.0")
+                return [], None
 
-        page_ids, next_cursor = await asyncio.to_thread(_get_page)
+        page_ids, list_next_cursor = await asyncio.to_thread(_get_page_primary)
 
-        if not page_ids:
-            return [], None
+        if page_ids:
+            records: list[dict[str, Any]] = []
+            for i in range(0, len(page_ids), _FETCH_BATCH):
+                batch = page_ids[i : i + _FETCH_BATCH]
+                try:
+                    result = await asyncio.to_thread(self._index.fetch, ids=batch)
+                    vectors = getattr(result, "vectors", {}) or {}
+                    for vid in batch:
+                        cid = vid[len("profile_"):]
+                        meta: dict[str, Any] = (
+                            dict(getattr(vectors.get(vid), "metadata", {}) or {})
+                            if vid in vectors else {}
+                        )
+                        meta.setdefault("candidate_id", cid)
+                        records.append(meta)
+                except Exception as exc:
+                    logger.error("kb_page_fetch_failed", batch_size=len(batch), error=str(exc))
+                    raise UpstreamServiceError("pinecone", f"fetch() failed for page: {exc}") from exc
 
-        # Fetch metadata only for this page's IDs — safe batch sizes keep URL < 2 KB
-        records: list[dict[str, Any]] = []
-        for i in range(0, len(page_ids), _FETCH_BATCH):
-            batch = page_ids[i : i + _FETCH_BATCH]
-            try:
-                result = await asyncio.to_thread(self._index.fetch, ids=batch)
-                vectors = getattr(result, "vectors", {}) or {}
-                for vid in batch:
-                    cid = vid[len("profile_"):]
-                    meta: dict[str, Any] = (
-                        dict(getattr(vectors.get(vid), "metadata", {}) or {})
-                        if vid in vectors else {}
-                    )
-                    meta.setdefault("candidate_id", cid)
-                    records.append(meta)
-            except Exception as exc:
-                logger.error("kb_page_fetch_failed", batch_size=len(batch), error=str(exc))
-                raise UpstreamServiceError("pinecone", f"fetch() failed for page: {exc}") from exc
+            logger.info("list_candidates_page_done", returned=len(records), has_next=list_next_cursor is not None, method="list_paginated")
+            return records, list_next_cursor
 
-        logger.info(
-            "list_candidates_page_done",
-            returned=len(records),
-            has_next=next_cursor is not None,
-        )
-        return records, next_cursor
+        # ── Fallback: query(chunk_index=0) + integer offset cursor ────────────
+        # list_paginated returned empty — Pinecone serverless v7 ignores prefix
+        # filters on list operations.  query() is always reliable: same path as
+        # search and stats.  We use a fixed uniform dummy vector so results are
+        # deterministic across pages.
+        logger.info("list_paginated_empty_fallback", hint="pinecone serverless prefix filter unreliable")
+
+        offset = int(cursor) if cursor and cursor.isdigit() else 0
+
+        try:
+            uniform = 1.0 / (_EMBED_DIM ** 0.5)
+            dummy = [uniform] * _EMBED_DIM
+            query_result = await asyncio.to_thread(
+                self._index.query,
+                vector=dummy,
+                top_k=10000,
+                filter={"chunk_index": {"$eq": 0}},
+                include_metadata=True,
+            )
+            all_records = [dict(m.metadata or {}) for m in (query_result.matches or [])]
+        except Exception as exc:
+            logger.error("kb_candidates_query_fallback_failed", error=str(exc))
+            raise UpstreamServiceError("pinecone", f"Candidates query failed: {exc}") from exc
+
+        page = all_records[offset : offset + limit]
+        next_cur = str(offset + limit) if offset + limit < len(all_records) else None
+
+        logger.info("list_candidates_page_done", returned=len(page), has_next=next_cur is not None, method="query_offset", total_found=len(all_records))
+        return page, next_cur
 
     async def get_stats_sample(
         self,
