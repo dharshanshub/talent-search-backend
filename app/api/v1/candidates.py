@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import io
+import uuid
 from pathlib import Path
 
 import structlog
 from fastapi import APIRouter, File, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
@@ -21,56 +22,71 @@ _RESUME_DIR = Path(__file__).resolve().parents[3] / "data" / "resumes"
 _MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
-# ── Serve an existing resume PDF ──────────────────────────────────────────────
+# ── Serve a resume PDF ────────────────────────────────────────────────────────
 
-@router.get("/{candidate_id}/resume")
-async def get_resume(candidate_id: str, request: Request) -> FileResponse:
-    """Serve the stored PDF for a known candidate.
+@router.get("/{candidate_id}/resume", response_model=None)
+async def get_resume(candidate_id: str, request: Request) -> FileResponse | RedirectResponse:
+    """Serve a candidate's resume PDF.
+
+    Priority:
+      1. Azure Blob Storage → 302 redirect to a 60-min SAS URL (when configured)
+      2. Local disk fallback (dev / legacy seeded candidates)
+      3. 404 if neither source has the file
 
     Raises:
-        NotFoundError: if no PDF exists for the given candidate_id.
+        BadRequestError: if the candidate_id contains path-traversal characters.
+        NotFoundError: if the PDF cannot be found in blob or on disk.
     """
     request_id = get_correlation_id()
 
-    # Basic path-traversal guard — candidate IDs are alphanumeric + underscores
-    if not candidate_id.replace("_", "").replace("-", "").isalnum():
-        logger.warning(
-            "resume_invalid_id",
-            candidate_id=candidate_id,
-            request_id=request_id,
-        )
+    # Guard against path traversal — candidate IDs are alphanumeric + underscores/hyphens
+    if not all(c.isalnum() or c in "_-" for c in candidate_id):
+        logger.warning("resume_invalid_id", candidate_id=candidate_id, request_id=request_id)
         raise BadRequestError("Invalid candidate ID")
 
-    pdf_path = _RESUME_DIR / f"{candidate_id}.pdf"
-    if not pdf_path.exists():
-        logger.info(
-            "resume_not_found",
-            candidate_id=candidate_id,
-            path=str(pdf_path),
-            request_id=request_id,
-        )
-        raise NotFoundError(f"Resume not found for candidate '{candidate_id}'")
+    blob_name = f"{candidate_id}.pdf"
+    blob_service = request.app.state.blob_service
 
-    logger.info("resume_served", candidate_id=candidate_id, request_id=request_id)
-    return FileResponse(
-        str(pdf_path),
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f"inline; filename={candidate_id}_resume.pdf",
-            "Cache-Control": "public, max-age=3600",
-        },
-    )
+    # 1 — Try Blob Storage (Azure)
+    if blob_service.available:
+        try:
+            sas_url = await blob_service.get_sas_url(blob_name, expiry_minutes=60)
+            if sas_url:
+                logger.info("resume_served_blob", candidate_id=candidate_id, request_id=request_id)
+                return RedirectResponse(url=sas_url, status_code=302)
+        except UpstreamServiceError as exc:
+            # Log but fall through to local disk — don't hard-fail for a SAS error
+            logger.warning("resume_blob_fallback", reason=str(exc), candidate_id=candidate_id)
+
+    # 2 — Fall back to local disk (dev environment / legacy seeded candidates)
+    pdf_path = _RESUME_DIR / blob_name
+    if pdf_path.exists():
+        logger.info("resume_served_local", candidate_id=candidate_id, request_id=request_id)
+        return FileResponse(
+            str(pdf_path),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"inline; filename={blob_name}",
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
+
+    logger.info("resume_not_found", candidate_id=candidate_id, request_id=request_id)
+    raise NotFoundError(f"Resume not found for candidate '{candidate_id}'")
 
 
 # ── Upload PDF → LLM extraction ───────────────────────────────────────────────
 
 @router.post("/upload", response_model=UploadResponse)
 async def upload_resume(request: Request, file: UploadFile = File(...)) -> UploadResponse:
-    """Accept a resume PDF, extract text, run LLM extraction, return structured profile.
+    """Accept a resume PDF, save it to Blob Storage, run LLM extraction.
+
+    The candidate_id is generated here (not at index time) so the PDF is already
+    named and stored before the user reaches the human-review step.
 
     Raises:
-        BadRequestError: for non-PDF files, oversized files, unreadable PDFs, or empty text.
-        UpstreamServiceError: if the OpenAI extraction call fails.
+        BadRequestError: for wrong type, oversized file, unreadable PDF, or empty text.
+        UpstreamServiceError: if Blob upload or OpenAI extraction fails.
     """
     request_id = get_correlation_id()
 
@@ -83,26 +99,38 @@ async def upload_resume(request: Request, file: UploadFile = File(...)) -> Uploa
         )
         raise BadRequestError("Only PDF files are supported")
 
-    # Read once; avoid streaming edge-cases
     try:
         contents = await file.read()
     except Exception as exc:
         logger.error("upload_read_failed", error=str(exc), request_id=request_id)
         raise BadRequestError(f"Could not read uploaded file: {exc}") from exc
 
-    if len(contents) > _MAX_FILE_BYTES:
-        raise BadRequestError(
-            f"File too large — maximum {_MAX_FILE_BYTES // (1024 * 1024)} MB"
-        )
     if len(contents) == 0:
         raise BadRequestError("Uploaded file is empty")
+    if len(contents) > _MAX_FILE_BYTES:
+        raise BadRequestError(f"File too large — maximum {_MAX_FILE_BYTES // (1024 * 1024)} MB")
+
+    # Generate candidate_id now so blob and Pinecone share the same key
+    candidate_id = f"uploaded_{uuid.uuid4().hex[:10]}"
+    blob_filename = f"{candidate_id}.pdf"
 
     logger.info(
         "upload_received",
         filename=file.filename,
         bytes=len(contents),
+        candidate_id=candidate_id,
         request_id=request_id,
     )
+
+    # Save PDF to Blob Storage (no-op locally when Azure is not configured)
+    blob_service = request.app.state.blob_service
+    try:
+        await blob_service.upload(blob_filename, contents)
+    except UpstreamServiceError:
+        raise
+    except Exception as exc:
+        logger.error("upload_blob_failed", error=str(exc), request_id=request_id)
+        raise UpstreamServiceError("azure_blob", f"Blob upload failed: {exc}") from exc
 
     # Extract text from PDF bytes
     try:
@@ -110,26 +138,16 @@ async def upload_resume(request: Request, file: UploadFile = File(...)) -> Uploa
         pages = [page.extract_text() or "" for page in reader.pages]
         raw_text = "\n\n".join(pages).strip()
     except PdfReadError as exc:
-        logger.error(
-            "pdf_corrupt",
-            error=str(exc),
-            filename=file.filename,
-            request_id=request_id,
-        )
-        raise BadRequestError(f"PDF file is corrupted or password-protected: {exc}") from exc
+        logger.error("pdf_corrupt", error=str(exc), filename=file.filename, request_id=request_id)
+        raise BadRequestError(f"PDF is corrupted or password-protected: {exc}") from exc
     except Exception as exc:
-        logger.error(
-            "pdf_parse_failed",
-            error=str(exc),
-            filename=file.filename,
-            request_id=request_id,
-        )
+        logger.error("pdf_parse_failed", error=str(exc), filename=file.filename, request_id=request_id)
         raise BadRequestError(f"Could not parse PDF: {exc}") from exc
 
     if not raw_text:
         raise BadRequestError(
-            "PDF appears to contain no extractable text — "
-            "it may be a scanned image. Please use a text-based PDF."
+            "PDF contains no extractable text — it may be a scanned image. "
+            "Please use a text-based PDF."
         )
 
     logger.info(
@@ -140,17 +158,22 @@ async def upload_resume(request: Request, file: UploadFile = File(...)) -> Uploa
         request_id=request_id,
     )
 
-    # LLM extraction — errors are typed (BadRequestError or UpstreamServiceError)
+    # LLM extraction
     screening = request.app.state.screening_service
     try:
         extracted = await screening.extract(raw_text)
     except (BadRequestError, UpstreamServiceError):
-        raise  # already structured and logged
+        raise
     except Exception as exc:
         logger.error("extraction_unexpected", error=str(exc), request_id=request_id)
         raise UpstreamServiceError("openai", f"Unexpected extraction error: {exc}") from exc
 
-    return UploadResponse(extracted=extracted, raw_text=raw_text)
+    return UploadResponse(
+        candidate_id=candidate_id,
+        blob_filename=blob_filename,
+        extracted=extracted,
+        raw_text=raw_text,
+    )
 
 
 # ── Index validated candidate ─────────────────────────────────────────────────
@@ -170,17 +193,22 @@ async def index_candidate(body: IndexRequest, request: Request) -> IndexResponse
 
     logger.info(
         "index_request",
+        candidate_id=body.candidate_id,
+        blob_filename=body.blob_filename,
         name=body.profile.name,
-        title=body.profile.title,
-        raw_text_chars=len(body.raw_text),
         request_id=request_id,
     )
 
     screening = request.app.state.screening_service
     try:
-        result = await screening.index(body.profile, body.raw_text)
+        result = await screening.index(
+            candidate_id=body.candidate_id,
+            blob_filename=body.blob_filename,
+            profile=body.profile,
+            raw_text=body.raw_text,
+        )
     except (BadRequestError, UpstreamServiceError):
-        raise  # already structured and logged
+        raise
     except Exception as exc:
         logger.error("index_unexpected", error=str(exc), request_id=request_id)
         raise UpstreamServiceError("pinecone", f"Unexpected indexing error: {exc}") from exc
