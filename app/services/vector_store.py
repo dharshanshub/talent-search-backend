@@ -214,24 +214,27 @@ class PineconeStore:
         cursor: str | None,
         limit: int,
         search: str | None = None,
+        seniority: str | None = None,
     ) -> tuple[list[dict[str, Any]], str | None]:
         """Return one page of candidate metadata.
 
         Primary path: list_paginated(prefix="profile_") + fetch().
         Fallback path: query(chunk_index=0) + integer offset cursor.
 
-        Pinecone SDK v7 on serverless indexes does not honour prefix filters on
-        list/list_paginated, so both return empty even when profile_ vectors exist.
-        The fallback uses query() which is always reliable on serverless — the same
-        path search and stats already use.
+        When search or seniority is provided, skips pagination and returns all
+        matching profiles across the full pool:
+          - seniority: passed as a Pinecone metadata $eq filter (server-side, fast).
+          - search: substring match on name/title/role applied in memory after the
+            Pinecone query (Pinecone has no substring operator).
 
         Args:
-            cursor: Pinecone pagination token (primary) or integer offset string
-                    (fallback).  None = first page.
-            limit:  Records per page (1–100).
+            cursor:    Pinecone pagination token or integer offset string. None = first page.
+            limit:     Records per page (1–100). Ignored when search/seniority is active.
+            search:    Substring to match against name, title, or role (case-insensitive).
+            seniority: Exact seniority value to filter by (e.g. "Senior").
 
         Returns:
-            (records, next_cursor) — next_cursor is None on the last page.
+            (records, next_cursor) — next_cursor is None on the last page or when filtering.
         """
         if self._index is None:
             return [], None
@@ -242,12 +245,16 @@ class PineconeStore:
         def _to_str(item: Any) -> str:
             return item if isinstance(item, str) else str(getattr(item, "id", item))
 
-        # ── Search mode: query all, filter by name/title/role, return all matches ──
-        # When a search term is provided we skip pagination entirely and return every
-        # candidate whose name, title, or role contains the term (case-insensitive).
-        # Uses the same query(chunk_index=0) path as stats — always reliable on serverless.
-        if search:
-            search_lower = search.strip().lower()
+        # ── Filter mode: query all profiles with optional Pinecone metadata filter ──
+        # Active when search term or seniority filter is present.  Skips cursor
+        # pagination and returns all matches so the UI can show the full result set.
+        # Seniority goes to Pinecone as an $eq filter (server-side); substring text
+        # matching is applied in memory afterward.
+        if search or seniority:
+            search_lower = search.strip().lower() if search else None
+            pinecone_filter: dict[str, Any] = {"chunk_index": {"$eq": 0}}
+            if seniority:
+                pinecone_filter["seniority"] = {"$eq": seniority}
             try:
                 uniform = 1.0 / (_EMBED_DIM ** 0.5)
                 dummy = [uniform] * _EMBED_DIM
@@ -255,21 +262,25 @@ class PineconeStore:
                     self._index.query,
                     vector=dummy,
                     top_k=10000,
-                    filter={"chunk_index": {"$eq": 0}},
+                    filter=pinecone_filter,
                     include_metadata=True,
                 )
                 all_records = [dict(m.metadata or {}) for m in (query_result.matches or [])]
             except Exception as exc:
-                logger.error("kb_search_query_failed", search=search, error=str(exc))
-                raise UpstreamServiceError("pinecone", f"Search query failed: {exc}") from exc
+                logger.error("kb_filter_query_failed", search=search, seniority=seniority, error=str(exc))
+                raise UpstreamServiceError("pinecone", f"Filter query failed: {exc}") from exc
 
-            matches = [
-                r for r in all_records
-                if search_lower in (r.get("name") or "").lower()
-                or search_lower in (r.get("title") or "").lower()
-                or search_lower in (r.get("role") or "").lower()
-            ]
-            logger.info("list_candidates_search_done", term=search, matched=len(matches), total_scanned=len(all_records))
+            if search_lower:
+                matches = [
+                    r for r in all_records
+                    if search_lower in (r.get("name") or "").lower()
+                    or search_lower in (r.get("title") or "").lower()
+                    or search_lower in (r.get("role") or "").lower()
+                ]
+            else:
+                matches = all_records
+
+            logger.info("list_candidates_filter_done", search=search, seniority=seniority, matched=len(matches), scanned=len(all_records))
             return matches, None
 
         # ── Primary: list_paginated + fetch ───────────────────────────────────
