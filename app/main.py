@@ -166,6 +166,18 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(api_router)
 
+    @app.get("/", include_in_schema=False)
+    async def root():
+        return {
+            "service": "Talent Search RAG API",
+            "version": "1.0.0",
+            "status": "ok",
+            "docs": "/docs" if settings.app_env == "dev" else None,
+            "health": "/health",
+            "api": "/api/v1",
+            "note": "This is the backend API. Open the frontend app URL to use the UI.",
+        }
+
     return app
 
 

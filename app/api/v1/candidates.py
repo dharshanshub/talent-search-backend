@@ -4,9 +4,10 @@ import io
 import uuid
 from pathlib import Path
 
+import httpx
 import structlog
 from fastapi import APIRouter, File, Request, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, Response
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
@@ -24,22 +25,24 @@ _MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 # ── Serve a resume PDF ────────────────────────────────────────────────────────
 
+_PDF_HEADERS = {"Content-Disposition": "inline; filename={name}", "Cache-Control": "private, max-age=3600"}
+
+
 @router.get("/{candidate_id}/resume", response_model=None)
-async def get_resume(candidate_id: str, request: Request) -> FileResponse | RedirectResponse:
+async def get_resume(candidate_id: str, request: Request) -> Response | FileResponse:
     """Serve a candidate's resume PDF.
 
+    Always returns the raw PDF bytes so the frontend can fetch with an
+    Authorization header and create a blob URL — avoids CORS issues with
+    direct browser requests to blob storage.
+
     Priority:
-      1. Azure Blob Storage → 302 redirect to a 60-min SAS URL (when configured)
+      1. Azure Blob Storage → proxy bytes fetched via SAS URL
       2. Local disk fallback (dev / legacy seeded candidates)
       3. 404 if neither source has the file
-
-    Raises:
-        BadRequestError: if the candidate_id contains path-traversal characters.
-        NotFoundError: if the PDF cannot be found in blob or on disk.
     """
     request_id = get_correlation_id()
 
-    # Guard against path traversal — candidate IDs are alphanumeric + underscores/hyphens
     if not all(c.isalnum() or c in "_-" for c in candidate_id):
         logger.warning("resume_invalid_id", candidate_id=candidate_id, request_id=request_id)
         raise BadRequestError("Invalid candidate ID")
@@ -47,16 +50,24 @@ async def get_resume(candidate_id: str, request: Request) -> FileResponse | Redi
     blob_name = f"{candidate_id}.pdf"
     blob_service = request.app.state.blob_service
 
-    # 1 — Try Blob Storage (Azure)
+    # 1 — Try Blob Storage (Azure): fetch bytes server-side and proxy to client
     if blob_service.available:
         try:
             sas_url = await blob_service.get_sas_url(blob_name, expiry_minutes=60)
             if sas_url:
+                async with httpx.AsyncClient(timeout=30) as http:
+                    blob_resp = await http.get(sas_url)
+                    blob_resp.raise_for_status()
                 logger.info("resume_served_blob", candidate_id=candidate_id, request_id=request_id)
-                return RedirectResponse(url=sas_url, status_code=302)
+                return Response(
+                    content=blob_resp.content,
+                    media_type="application/pdf",
+                    headers={"Content-Disposition": f"inline; filename={blob_name}", "Cache-Control": "private, max-age=3600"},
+                )
         except UpstreamServiceError as exc:
-            # Log but fall through to local disk — don't hard-fail for a SAS error
             logger.warning("resume_blob_fallback", reason=str(exc), candidate_id=candidate_id)
+        except httpx.HTTPError as exc:
+            logger.warning("resume_blob_fetch_failed", reason=str(exc), candidate_id=candidate_id)
 
     # 2 — Fall back to local disk (dev environment / legacy seeded candidates)
     pdf_path = _RESUME_DIR / blob_name
@@ -65,10 +76,7 @@ async def get_resume(candidate_id: str, request: Request) -> FileResponse | Redi
         return FileResponse(
             str(pdf_path),
             media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"inline; filename={blob_name}",
-                "Cache-Control": "public, max-age=3600",
-            },
+            headers={"Content-Disposition": f"inline; filename={blob_name}", "Cache-Control": "private, max-age=3600"},
         )
 
     logger.info("resume_not_found", candidate_id=candidate_id, request_id=request_id)
