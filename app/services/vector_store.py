@@ -218,8 +218,11 @@ class PineconeStore:
     ) -> tuple[list[dict[str, Any]], str | None]:
         """Return one page of candidate metadata.
 
-        Primary path: list_paginated(prefix="profile_") + fetch().
-        Fallback path: query(chunk_index=0) + integer offset cursor.
+        Source of truth: query(filter={chunk_index: 0}) + integer offset cursor.
+        Every candidate has exactly one chunk_index=0 chunk carrying full metadata,
+        so this captures the entire pool — both legacy candidates (chunk vectors
+        only) and new ones (which additionally have a profile_ vector).  profile_
+        vectors carry no chunk_index, so they are never double-counted.
 
         When search or seniority is provided, skips pagination and returns all
         matching profiles across the full pool:
@@ -228,7 +231,7 @@ class PineconeStore:
             Pinecone query (Pinecone has no substring operator).
 
         Args:
-            cursor:    Pinecone pagination token or integer offset string. None = first page.
+            cursor:    Integer offset string. None = first page.
             limit:     Records per page (1–100). Ignored when search/seniority is active.
             search:    Substring to match against name, title, or role (case-insensitive).
             seniority: Exact seniority value to filter by (e.g. "Senior").
@@ -239,11 +242,7 @@ class PineconeStore:
         if self._index is None:
             return [], None
 
-        _FETCH_BATCH = 20  # keep URL length < 2 KB
         _EMBED_DIM = 1536
-
-        def _to_str(item: Any) -> str:
-            return item if isinstance(item, str) else str(getattr(item, "id", item))
 
         # ── Filter mode: query all profiles with optional Pinecone metadata filter ──
         # Active when search term or seniority filter is present.  Skips cursor
@@ -283,52 +282,17 @@ class PineconeStore:
             logger.info("list_candidates_filter_done", search=search, seniority=seniority, matched=len(matches), scanned=len(all_records))
             return matches, None
 
-        # ── Primary: list_paginated + fetch ───────────────────────────────────
-        def _get_page_primary() -> tuple[list[str], str | None]:
-            try:
-                result = self._index.list_paginated(
-                    prefix="profile_",
-                    limit=limit,
-                    pagination_token=cursor if cursor and not cursor.isdigit() else None,
-                )
-                ids = [_to_str(v) for v in (result.vectors or [])]
-                next_cur = result.pagination.next if result.pagination else None
-                return ids, next_cur
-            except AttributeError:
-                logger.warning("list_paginated_unavailable", hint="upgrade pinecone>=3.0")
-                return [], None
-
-        page_ids, list_next_cursor = await asyncio.to_thread(_get_page_primary)
-
-        if page_ids:
-            records: list[dict[str, Any]] = []
-            for i in range(0, len(page_ids), _FETCH_BATCH):
-                batch = page_ids[i : i + _FETCH_BATCH]
-                try:
-                    result = await asyncio.to_thread(self._index.fetch, ids=batch)
-                    vectors = getattr(result, "vectors", {}) or {}
-                    for vid in batch:
-                        cid = vid[len("profile_"):]
-                        meta: dict[str, Any] = (
-                            dict(getattr(vectors.get(vid), "metadata", {}) or {})
-                            if vid in vectors else {}
-                        )
-                        meta.setdefault("candidate_id", cid)
-                        records.append(meta)
-                except Exception as exc:
-                    logger.error("kb_page_fetch_failed", batch_size=len(batch), error=str(exc))
-                    raise UpstreamServiceError("pinecone", f"fetch() failed for page: {exc}") from exc
-
-            logger.info("list_candidates_page_done", returned=len(records), has_next=list_next_cursor is not None, method="list_paginated")
-            return records, list_next_cursor
-
-        # ── Fallback: query(chunk_index=0) + integer offset cursor ────────────
-        # list_paginated returned empty — Pinecone serverless v7 ignores prefix
-        # filters on list operations.  query() is always reliable: same path as
-        # search and stats.  We use a fixed uniform dummy vector so results are
-        # deterministic across pages.
-        logger.info("list_paginated_empty_fallback", hint="pinecone serverless prefix filter unreliable")
-
+        # ── Unfiltered browse: query(chunk_index=0) is the single source of truth ──
+        # Every candidate — legacy (chunk vectors only) AND new (which also have a
+        # profile_ vector) — has exactly one chunk_index=0 chunk carrying full
+        # metadata.  profile_ vectors have no chunk_index field, so they are never
+        # matched here: one record per candidate, no duplication.
+        #
+        # We deliberately do NOT paginate over list(prefix="profile_") here: that
+        # would silently hide every legacy candidate that has no profile_ vector
+        # (e.g. seeded data), which is the cause of the "only the newest profile
+        # shows up" bug.  At this pool size a single query + offset slice is cheap
+        # and, crucially, complete.
         offset = int(cursor) if cursor and cursor.isdigit() else 0
 
         try:
@@ -343,13 +307,29 @@ class PineconeStore:
             )
             all_records = [dict(m.metadata or {}) for m in (query_result.matches or [])]
         except Exception as exc:
-            logger.error("kb_candidates_query_fallback_failed", error=str(exc))
+            logger.error("kb_candidates_query_failed", error=str(exc))
             raise UpstreamServiceError("pinecone", f"Candidates query failed: {exc}") from exc
+
+        # Deterministic order so offset pagination is stable across page requests
+        # (the dummy-vector query order is not guaranteed stable).  Newest first.
+        all_records.sort(
+            key=lambda r: (
+                str(r.get("indexed_at") or r.get("last_updated") or ""),
+                str(r.get("candidate_id") or ""),
+            ),
+            reverse=True,
+        )
 
         page = all_records[offset : offset + limit]
         next_cur = str(offset + limit) if offset + limit < len(all_records) else None
 
-        logger.info("list_candidates_page_done", returned=len(page), has_next=next_cur is not None, method="query_offset", total_found=len(all_records))
+        logger.info(
+            "list_candidates_page_done",
+            returned=len(page),
+            has_next=next_cur is not None,
+            method="query_chunk0",
+            total_found=len(all_records),
+        )
         return page, next_cur
 
     async def get_stats_sample(
@@ -401,16 +381,24 @@ class PineconeStore:
             return count
 
         metadata_task = asyncio.create_task(_query_metadata())
-        total = await asyncio.to_thread(_count_profile_ids)
+        profile_count = await asyncio.to_thread(_count_profile_ids)
         metadata_sample = await metadata_task
 
-        # If profile_ count failed, fall back to number of query matches
-        if total == 0:
-            total = len(metadata_sample)
+        # total = unique candidate count.  profile_ vectors exist ONLY for candidates
+        # added via the new upload flow; legacy/seeded candidates have chunk vectors
+        # only.  The chunk_index=0 sample holds one record per candidate (a superset
+        # of profile_), so its distinct candidate_id count is the reliable total.
+        # max() keeps it correct even if the sample is ever capped below the real
+        # total at very large pool sizes, where the profile_ count would be higher.
+        distinct_in_sample = len({
+            r.get("candidate_id") for r in metadata_sample if r.get("candidate_id")
+        })
+        total = max(profile_count, distinct_in_sample)
 
         logger.info(
             "stats_sample_done",
             sampled=len(metadata_sample),
+            profile_vectors=profile_count,
             total_profiles=total,
         )
         return metadata_sample, total
